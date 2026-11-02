@@ -6,7 +6,8 @@
   "scripts": {
     "start": "tsx floorplan-marketing.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test floorplan-marketing.test.ts"
+    "test": "tsx --test floorplan-marketing.test.ts",
+    "ui": "tsx server.ts"
   },
   "dependencies": {
     "@google/genai": "^2.32.0",
