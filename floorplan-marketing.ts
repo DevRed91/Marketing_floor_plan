@@ -139,6 +139,11 @@ function toGeminiSchema(schema: z.ZodType): unknown {
 // Gemini calls
 // --------------------------------------------------------------------------------------
 function makeClient(): GoogleGenAI {
+  try {
+    process.loadEnvFile?.();
+  } catch {
+    // .env file not found or not accessible
+  }
   const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
   if (!apiKey) fail("Set GEMINI_API_KEY (or GOOGLE_API_KEY) first.");
   return new GoogleGenAI({ apiKey });
