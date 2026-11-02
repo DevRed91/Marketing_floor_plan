@@ -9,5 +9,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "files": ["floorplan-marketing.ts"]
+  "files": ["floorplan-marketing.ts", "server.ts"]
 }
