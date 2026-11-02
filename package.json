@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "tsx floorplan-marketing.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test floorplan-marketing.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.32.0",

@@ -223,18 +223,27 @@ DO NOT INCLUDE
 - Anything beyond the unit's outline.`;
 }
 
+export function extractFinalCandidateImage(
+  candidates: Array<{ content?: { parts?: Array<{ inlineData?: { data?: string }; thought?: boolean }> } }> | undefined,
+): string | null {
+  let lastImageBase64: string | null = null;
+  for (const cand of candidates ?? []) {
+    for (const part of cand.content?.parts ?? []) {
+      if ((part as any).thought) continue;
+      if (part.inlineData?.data) lastImageBase64 = part.inlineData.data;
+    }
+  }
+  return lastImageBase64;
+}
+
 async function generateCandidate(ai: GoogleGenAI, cleanPng: Buffer, prompt: string, aspectRatio: string, size: string): Promise<Buffer | null> {
   const resp = await ai.models.generateContent({
     model: IMAGE_MODEL,
     contents: [{ role: "user", parts: [imagePart(cleanPng), { text: prompt }] }],
     config: { responseModalities: [Modality.IMAGE], imageConfig: { aspectRatio, imageSize: size } },
   });
-  for (const cand of resp.candidates ?? []) {
-    for (const part of cand.content?.parts ?? []) {
-      if (part.inlineData?.data) return sharp(Buffer.from(part.inlineData.data, "base64")).png().toBuffer();
-    }
-  }
-  return null;
+  const data = extractFinalCandidateImage(resp.candidates);
+  return data ? sharp(Buffer.from(data, "base64")).png().toBuffer() : null;
 }
 
 async function judge(ai: GoogleGenAI, sourcePng: Buffer, candidatePng: Buffer, ex: Extraction): Promise<Judgement> {
@@ -259,7 +268,7 @@ fidelity_score: 10 = identical layout, 7 = small visual drift but every wall/doo
   );
 }
 
-function judgementProblems(j: Judgement, ex: Extraction, tolerance: number): string[] {
+export function judgementProblems(j: Judgement, ex: Extraction, tolerance: number): string[] {
   const problems: string[] = [];
   const lists: [string, string[]][] = [
     ["missing rooms", j.missing_rooms],
@@ -277,6 +286,7 @@ function judgementProblems(j: Judgement, ex: Extraction, tolerance: number): str
   if (j.people_present) problems.push("people present");
   if (!j.top_down_orthographic) problems.push("not a straight top-down view");
   if (j.text_or_numbers_present) problems.push("text or numbers present in the render");
+  if (j.fidelity_score < 7) problems.push(`fidelity score ${j.fidelity_score}/10 is below minimum 7`);
   return problems;
 }
 
@@ -425,8 +435,8 @@ export async function cleanPlan(img: RGB, ex: Extraction): Promise<{ clean: RGB;
   let k = 4;
   try {
     ({ bbox, walls, k } = detectWalls(img));
-  } catch {
-    /* fall back to the whole image */
+  } catch (err) {
+    console.warn(`Warning: wall detection failed (${(err as Error).message ?? err}); falling back to uncropped source.`);
   }
   const out = Buffer.from(img.data);
   const paint = (x0: number, y0: number, x1: number, y1: number) => {
@@ -504,8 +514,8 @@ function labelSvg(cx: number, cy: number, name: string, sizeLabel: string, nameP
   return svg;
 }
 
-function compassSvg(cx: number, cy: number, r: number, direction: string): string {
-  const angle = { up: 0, right: 90, down: 180, left: 270 }[direction] ?? 0;
+export function compassSvg(cx: number, cy: number, r: number, direction: "up" | "right" | "down" | "left"): string {
+  const angle = { up: 0, right: 90, down: 180, left: 270 }[direction];
   const rad = (angle * Math.PI) / 180;
   const nx = cx + r * 1.45 * Math.sin(rad), ny = cy - r * 1.45 * Math.cos(rad);
   const pts = [[0, -r * 0.72], [-r * 0.32, r * 0.45], [0, r * 0.2], [r * 0.32, r * 0.45]].map(([x, y]) => `${cx + x},${cy + y}`).join(" ");
@@ -541,12 +551,14 @@ export async function composeFinal(
     const roomRect: Rect | null = rb && rb[2] > rb[0] && rb[3] > rb[1] ? [...toPlan(rb[0], rb[1]), ...toPlan(rb[2], rb[3])] : null;
     if (x >= 0 && x <= W && y >= 0 && y <= H) svg += labelSvg(x, y, room.name, room.size_label, namePx, sizePx, roomRect);
   }
-  const r = Math.max(14, Math.floor(W * 0.028));
-  const cb = ex.compass_box.length ? boxToPx(ex.compass_box, ow, oh) : null;
-  let [x, y] = cb ? toPlan((cb[0] + cb[2]) / 2, (cb[1] + cb[3]) / 2) : [W - 2.2 * r, 2.4 * r];
-  x = Math.min(Math.max(x, 1.6 * r), W - 1.6 * r);
-  y = Math.min(Math.max(y, 2.2 * r), H - 1.6 * r);
-  svg += compassSvg(x, y, r, ex.north_direction);
+  if (ex.north_direction !== "unknown") {
+    const r = Math.max(14, Math.floor(W * 0.028));
+    const cb = ex.compass_box.length ? boxToPx(ex.compass_box, ow, oh) : null;
+    let [x, y] = cb ? toPlan((cb[0] + cb[2]) / 2, (cb[1] + cb[3]) / 2) : [W - 2.2 * r, 2.4 * r];
+    x = Math.min(Math.max(x, 1.6 * r), W - 1.6 * r);
+    y = Math.min(Math.max(y, 2.2 * r), H - 1.6 * r);
+    svg += compassSvg(x, y, r, ex.north_direction);
+  }
 
   const footerH = Math.max(40, Math.floor(W * 0.055));
   const footerPx = Math.max(10, Math.floor(footerH * 0.28));
@@ -584,6 +596,23 @@ export async function sideBySide(leftPng: Buffer, rightPng: Buffer): Promise<Buf
 // --------------------------------------------------------------------------------------
 // Main
 // --------------------------------------------------------------------------------------
+export function validateCliArgs(
+  size: string | undefined,
+  candidatesStr: string | undefined,
+  toleranceStr: string | undefined,
+): { ok: true; nCandidates: number; tolerance: number } | { ok: false; error: string } {
+  if (!size || !["1K", "2K", "4K"].includes(size)) return { ok: false, error: "--size must be 1K, 2K or 4K" };
+  const nCandidates = Number(candidatesStr);
+  if (!Number.isInteger(nCandidates) || nCandidates < 1 || nCandidates > 10) {
+    return { ok: false, error: "--candidates must be an integer between 1 and 10" };
+  }
+  const tolerance = Number(toleranceStr);
+  if (!Number.isInteger(tolerance) || tolerance < 0 || tolerance > 50) {
+    return { ok: false, error: "--tolerance must be an integer between 0 and 50" };
+  }
+  return { ok: true, nCandidates, tolerance };
+}
+
 function fail(msg: string, code = 1): never {
   console.error(msg);
   process.exit(code);
@@ -620,7 +649,7 @@ async function main() {
   if (o.help || positionals.length !== 1) {
     console.log(`Usage: npx tsx floorplan-marketing.ts <plan.png> [options]
   --out <dir>          Output folder (default ./out/<plan name>)
-  --candidates <n>     Number of render candidates (default 3)
+  --candidates <n>     Number of render candidates (default 3, max 10)
   --size 1K|2K|4K      Render resolution (default 2K)
   --logo <file>        Optional logo for the footer
   --extraction <file>  Reuse an existing (possibly hand-edited) extraction.json
@@ -629,8 +658,9 @@ async function main() {
   --force              Bypass input checks and compose the best candidate even if it fails`);
     process.exit(o.help ? 0 : 1);
   }
-  if (!["1K", "2K", "4K"].includes(o.size!)) fail("--size must be 1K, 2K or 4K");
-  const nCandidates = Number(o.candidates), tolerance = Number(o.tolerance);
+  const validation = validateCliArgs(o.size, o.candidates, o.tolerance);
+  if (!validation.ok) fail(validation.error);
+  const { nCandidates, tolerance } = validation;
 
   const t0 = Date.now();
   const planPath = positionals[0];
@@ -684,25 +714,47 @@ async function main() {
   await writeFile(path.join(out, "prompt.txt"), prompt);
   console.log(`\nGenerating ${nCandidates} candidates with ${IMAGE_MODEL} (aspect ${ratio}, ${o.size}) ...`);
   const renders = new Map<number, Buffer>();
-  await Promise.all(
+  const genSettled = await Promise.allSettled(
     Array.from({ length: nCandidates }, (_, k) => k + 1).map(async (i) => {
       const r = await withRetry(() => generateCandidate(ai, padded.png, prompt, ratio, o.size!), `candidate ${i}`);
-      if (!r) return console.log(`  candidate ${i}: no image returned (possibly blocked)`);
+      if (!r) {
+        console.log(`  candidate ${i}: no image returned (possibly blocked)`);
+        return;
+      }
       await writeFile(path.join(out, "candidates", `candidate_${i}.png`), r);
       renders.set(i, r);
     }),
   );
+  for (let idx = 0; idx < genSettled.length; idx++) {
+    const res = genSettled[idx];
+    if (res.status === "rejected") {
+      console.warn(`  candidate ${idx + 1}: failed to generate: ${(res.reason as Error)?.message ?? res.reason}`);
+    }
+  }
   if (!renders.size) fail("No candidates were produced. Check the prompt or try again.");
 
   // 6. Verification
   console.log("Checking each candidate against the source plan ...");
-  const results = await Promise.all(
-    [...renders.entries()].sort(([a], [b]) => a - b).map(async ([i, r]) => {
+  const entries = [...renders.entries()].sort(([a], [b]) => a - b);
+  const judgeSettled = await Promise.allSettled(
+    entries.map(async ([i, r]) => {
       const j = await withRetry(() => judge(ai, padded.png, r, ex), `check ${i}`);
       const problems = judgementProblems(j, ex, tolerance);
       return { candidate: i, passed: !problems.length, score: j.fidelity_score, problems, judgement: j };
     }),
   );
+  const results: Array<{ candidate: number; passed: boolean; score: number; problems: string[]; judgement: Judgement }> = [];
+  for (let idx = 0; idx < judgeSettled.length; idx++) {
+    const res = judgeSettled[idx];
+    const candidateNum = entries[idx][0];
+    if (res.status === "fulfilled") {
+      results.push(res.value);
+    } else {
+      console.warn(`  candidate ${candidateNum}: check failed: ${(res.reason as Error)?.message ?? res.reason}`);
+    }
+  }
+  if (!results.length) fail("No candidate checks completed successfully. Check the judge prompt or try again.");
+
   for (const r of results)
     console.log(`  candidate ${r.candidate}: ${r.passed ? "PASS" : "FAIL"}  score ${r.score}/10${r.passed ? "" : `  -> ${r.problems.join(" | ")}`}`);
 
